@@ -9,6 +9,38 @@ multi_lidar_node:
     # Publishing frequency in Hz
     publish_frequency: 10.0
 
+    # ROI Filter parameters
+    enable_roi_filter: true
+    roi_filters:
+      - name: "front_area_positive"
+        type: "positive"
+        min_x: 0.0
+        max_x: 10.0
+        min_y: -2.0
+        max_y: 2.0
+        min_z: -1.0
+        max_z: 3.0
+      - name: "rear_area_negative"
+        type: "negative"
+        min_x: -10.0
+        max_x: 0.0
+        min_y: -1.0
+        max_y: 1.0
+        min_z: -1.0
+        max_z: 3.0
+      - name: "overhead_negative"
+        type: "negative"
+        min_x: -10.0
+        max_x: 10.0
+        min_y: -10.0
+        max_y: 10.0
+        min_z: 2.5
+        max_z: 10.0
+
+    # Voxel Grid Filter parameters
+    enable_voxel_filter: false
+    voxel_leaf_size: 0.1 # meters
+
     # List of lidars to be configured
     lidars:
       # Name of the first lidar (can be anything)

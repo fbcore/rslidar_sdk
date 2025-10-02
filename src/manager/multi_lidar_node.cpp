@@ -4,6 +4,8 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <pcl/registration/icp.h>
+#include <pcl/filters/crop_box.h>
+#include <pcl/filters/voxel_grid.h>
 #include <chrono>
 #include <thread>
 #include <algorithm>
@@ -14,6 +16,7 @@ MultiLidarNode::MultiLidarNode(const rclcpp::NodeOptions& options)
 {
   loadParameters();
   runInitialCalibration();
+  loadFilterParameters();
   
   double publish_frequency = this->declare_parameter("publish_frequency", 10.0);
   timer_ = this->create_wall_timer(
@@ -92,11 +95,105 @@ void MultiLidarNode::mergeAndPublish()
 
   if (!merged_cloud.empty())
   {
+    pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+    *filtered_cloud = merged_cloud;
+
+    // 1. Apply ROI Filters (multiple positive/negative with priority)
+    if (enable_roi_filter_ && !filtered_cloud->empty() && !roi_filters_.empty())
+    {
+      pcl::PointCloud<pcl::PointXYZI>::Ptr roi_filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+      for (const auto& point : filtered_cloud->points)
+      {
+        bool in_any_positive_box = false;
+        bool in_any_negative_box = false;
+
+        for (const auto& filter_config : roi_filters_)
+        {
+          bool in_box = (point.x >= filter_config.min_x && point.x <= filter_config.max_x &&
+                         point.y >= filter_config.min_y && point.y <= filter_config.max_y &&
+                         point.z >= filter_config.min_z && point.z <= filter_config.max_z);
+
+          if (in_box)
+          {
+            if (filter_config.type == "positive")
+            {
+              in_any_positive_box = true;
+            }
+            else if (filter_config.type == "negative")
+            {
+              in_any_negative_box = true;
+            }
+          }
+        }
+
+        // Priority logic: If in any positive box, keep. Else if not in any negative box, keep.
+        if (in_any_positive_box || (!in_any_negative_box && !in_any_positive_box))
+        {
+          roi_filtered_cloud->points.push_back(point);
+        }
+      }
+      roi_filtered_cloud->width = roi_filtered_cloud->points.size();
+      roi_filtered_cloud->height = 1;
+      roi_filtered_cloud->is_dense = true;
+      filtered_cloud = roi_filtered_cloud;
+    }
+
+    // 2. Apply Voxel Grid Filter
+    if (enable_voxel_filter_ && !filtered_cloud->empty())
+    {
+      pcl::VoxelGrid<pcl::PointXYZI> voxel_filter;
+      voxel_filter.setInputCloud(filtered_cloud);
+      voxel_filter.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
+      voxel_filter.filter(*filtered_cloud);
+    }
+
+    if (filtered_cloud->empty())
+    {
+      RCLCPP_WARN(this->get_logger(), "Filtered cloud is empty. Not publishing.");
+      return;
+    }
+
     sensor_msgs::msg::PointCloud2 output_msg;
-    pcl::toROSMsg(merged_cloud, output_msg);
+    pcl::toROSMsg(*filtered_cloud, output_msg);
     output_msg.header.stamp = this->get_clock()->now();
     output_msg.header.frame_id = base_frame_id_;
     merged_pub_->publish(output_msg);
+  }
+}
+
+void MultiLidarNode::loadFilterParameters()
+{
+  enable_roi_filter_ = this->declare_parameter("enable_roi_filter", false);
+  if (enable_roi_filter_)
+  {
+    RCLCPP_INFO(this->get_logger(), "[Filter] ROI filter enabled.");
+    auto roi_filters_param = this->declare_parameter<std::vector<rclcpp::Parameter>>("roi_filters", std::vector<rclcpp::Parameter>());
+
+    for (size_t i = 0; i < roi_filters_param.size(); ++i)
+    {
+      std::string prefix = "roi_filters." + std::to_string(i) + ".";
+      RoiFilterConfig config;
+      config.name = this->declare_parameter(prefix + "name", "unnamed_roi");
+      config.type = this->declare_parameter(prefix + "type", "positive");
+      config.min_x = this->declare_parameter(prefix + "min_x", -100.0f);
+      config.max_x = this->declare_parameter(prefix + "max_x", 100.0f);
+      config.min_y = this->declare_parameter(prefix + "min_y", -100.0f);
+      config.max_y = this->declare_parameter(prefix + "max_y", 100.0f);
+      config.min_z = this->declare_parameter(prefix + "min_z", -100.0f);
+      config.max_z = this->declare_parameter(prefix + "max_z", 100.0f);
+      roi_filters_.push_back(config);
+
+      RCLCPP_INFO(this->get_logger(), "  - ROI Filter '%s' (type: %s): X=[%f, %f], Y=[%f, %f], Z=[%f, %f]",
+                  config.name.c_str(), config.type.c_str(),
+                  config.min_x, config.max_x, config.min_y, config.max_y, config.min_z, config.max_z);
+    }
+  }
+
+  enable_voxel_filter_ = this->declare_parameter("enable_voxel_filter", false);
+  if (enable_voxel_filter_)
+  {
+    voxel_leaf_size_ = this->declare_parameter("voxel_leaf_size", 0.1f);
+    RCLCPP_INFO(this->get_logger(), "[Filter] Voxel filter enabled: leaf_size=%f", voxel_leaf_size_);
   }
 }
 
