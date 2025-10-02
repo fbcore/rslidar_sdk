@@ -1,4 +1,3 @@
-
 #ifndef CUDA_POINT_TYPES_CUH
 #define CUDA_POINT_TYPES_CUH
 
@@ -34,6 +33,15 @@ struct CudaMatrix4f
         res.intensity = p.intensity; // Intensity usually doesn't change with geometric transform
         return res;
     }
+};
+
+// LaserScan parameters for CUDA kernels
+struct CudaLaserScanParams
+{
+    float angle_min, angle_max, angle_increment;
+    float range_min, range_max;
+    float min_height, max_height;
+    size_t num_beams;
 };
 
 #endif // CUDA_POINT_TYPES_CUH

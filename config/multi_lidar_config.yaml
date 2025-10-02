@@ -6,6 +6,8 @@ multi_lidar_node:
     base_frame_id: "base_link"
     # Topic for the merged point cloud
     merged_topic_name: "/points_merged"
+    # Enable/Disable 3D PCD publishing
+    publish_3d_pcd: true
     # Publishing frequency in Hz
     publish_frequency: 10.0
 
@@ -40,6 +42,17 @@ multi_lidar_node:
     # Voxel Grid Filter parameters
     enable_voxel_filter: false
     voxel_leaf_size: 0.1 # meters
+
+    # FlatScan (LaserScan) parameters
+    publish_flatscan: false
+    flatscan_topic_name: "/flatscan"
+    flatscan_min_height: -0.1 # min Z for points to consider
+    flatscan_max_height: 0.1  # max Z for points to consider
+    flatscan_angle_min: -3.14159 # -M_PI
+    flatscan_angle_max: 3.14159  # M_PI
+    flatscan_angle_increment: 0.0087 # approx 0.5 degrees
+    flatscan_range_min: 0.1
+    flatscan_range_max: 100.0
 
     # List of lidars to be configured
     lidars:

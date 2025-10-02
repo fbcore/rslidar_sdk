@@ -184,7 +184,8 @@ add_executable(multi_lidar_node
                 src/manager/multi_lidar_node.cpp
                 src/core/cuda_transform_merge.cu
                 src/core/cuda_roi_filter.cu
-                src/core/cuda_voxel_grid.cu)
+                src/core/cuda_voxel_grid.cu
+                src/core/cuda_flatscan.cu)
 
 
 target_link_libraries(rslidar_sdk_node                   

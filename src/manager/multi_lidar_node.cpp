@@ -12,6 +12,7 @@
 #include "../core/cuda_transform_merge.cuh"
 #include "../core/cuda_roi_filter.cuh"
 #include "../core/cuda_voxel_grid.cuh"
+#include "../core/cuda_flatscan.cuh"
 
 
 MultiLidarNode::MultiLidarNode(const rclcpp::NodeOptions& options)
@@ -20,6 +21,7 @@ MultiLidarNode::MultiLidarNode(const rclcpp::NodeOptions& options)
   loadParameters();
   runInitialCalibration();
   loadFilterParameters();
+  loadFlatScanParameters(); // New call
   
   double publish_frequency = this->declare_parameter("publish_frequency", 10.0);
   timer_ = this->create_wall_timer(
@@ -31,7 +33,11 @@ void MultiLidarNode::loadParameters()
 {
   base_frame_id_ = this->declare_parameter("base_frame_id", "base_link");
   std::string merged_topic_name = this->declare_parameter("merged_topic_name", "/points_merged");
-  merged_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(merged_topic_name, 10);
+  publish_3d_pcd_ = this->declare_parameter("publish_3d_pcd", true);
+  if (publish_3d_pcd_)
+  {
+    merged_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(merged_topic_name, 10);
+  }
 
   auto lidar_params = this->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
   
@@ -101,6 +107,26 @@ void MultiLidarNode::loadFilterParameters()
   {
     voxel_leaf_size_ = this->declare_parameter("voxel_leaf_size", 0.1f);
     RCLCPP_INFO(this->get_logger(), "[Filter] Voxel filter enabled: leaf_size=%f", voxel_leaf_size_);
+  }
+}
+
+void MultiLidarNode::loadFlatScanParameters()
+{
+  publish_flatscan_ = this->declare_parameter("publish_flatscan", false);
+  if (publish_flatscan_)
+  {
+    flatscan_topic_name_ = this->declare_parameter("flatscan_topic_name", "/flatscan");
+    flatscan_min_height_ = this->declare_parameter("flatscan_min_height", -0.1f);
+    flatscan_max_height_ = this->declare_parameter("flatscan_max_height", 0.1f);
+    flatscan_angle_min_ = this->declare_parameter("flatscan_angle_min", -M_PI);
+    flatscan_angle_max_ = this->declare_parameter("flatscan_angle_max", M_PI);
+    flatscan_angle_increment_ = this->declare_parameter("flatscan_angle_increment", 0.0087f); // approx 0.5 deg
+    flatscan_range_min_ = this->declare_parameter("flatscan_range_min", 0.1f);
+    flatscan_range_max_ = this->declare_parameter("flatscan_range_max", 100.0f);
+
+    flatscan_pub_ = this->create_publisher<sensor_msgs::msg::LaserScan>(flatscan_topic_name_, 10);
+    RCLCPP_INFO(this->get_logger(), "[FlatScan] LaserScan publishing enabled on topic '%s'. Height range: [%f, %f]",
+                flatscan_topic_name_.c_str(), flatscan_min_height_, flatscan_max_height_);
   }
 }
 
@@ -215,8 +241,16 @@ void MultiLidarNode::runInitialCalibration()
 
 void MultiLidarNode::mergeAndPublish()
 {
+  // --- Early Exit if no publishing is enabled ---
+  if (!publish_3d_pcd_ && !publish_flatscan_)
+  {
+    RCLCPP_DEBUG(this->get_logger(), "Neither 3D PCD nor FlatScan publishing enabled. Skipping all processing.");
+    return;
+  }
+
   std::vector<CudaPointXYZI*> d_input_clouds;
   std::vector<size_t> h_input_counts;
+  std::vector<size_t> h_prefix_sums; // New: prefix sums
   std::vector<CudaMatrix4f> h_transforms;
   size_t total_points_to_merge = 0;
 
@@ -241,6 +275,17 @@ void MultiLidarNode::mergeAndPublish()
     return;
   }
 
+  // Calculate prefix sums
+  h_prefix_sums.resize(h_input_counts.size());
+  if (!h_input_counts.empty())
+  {
+    h_prefix_sums[0] = h_input_counts[0];
+    for (size_t i = 1; i < h_input_counts.size(); ++i)
+    {
+      h_prefix_sums[i] = h_prefix_sums[i-1] + h_input_counts[i];
+    }
+  }
+
   CudaPointXYZI* d_merged_cloud = nullptr;
   cudaError_t err = cudaMalloc((void**)&d_merged_cloud, total_points_to_merge * sizeof(CudaPointXYZI));
   if (err != cudaSuccess)
@@ -250,7 +295,7 @@ void MultiLidarNode::mergeAndPublish()
   }
 
   // Launch CUDA kernel for transform and merge
-  err = transformAndMergeGPU(d_input_clouds, h_input_counts, h_transforms, d_merged_cloud, total_points_to_merge);
+  err = transformAndMergeGPU(d_input_clouds, h_input_counts, h_prefix_sums, h_transforms, d_merged_cloud, total_points_to_merge);
   if (err != cudaSuccess)
   {
       RCLCPP_ERROR(this->get_logger(), "transformAndMergeGPU kernel launch failed: %s", cudaGetErrorString(err));
@@ -321,26 +366,76 @@ void MultiLidarNode::mergeAndPublish()
     return;
   }
 
-  // Copy final GPU cloud back to CPU for ROS publishing
-  pcl::PointCloud<pcl::PointXYZI>::Ptr final_cpu_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-  final_cpu_cloud->points.resize(num_voxel_filtered_points);
-  err = cudaMemcpy(final_cpu_cloud->points.data(), d_voxel_filtered_cloud, 
-                   num_voxel_filtered_points * sizeof(CudaPointXYZI), cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess)
+  // --- Conditional Publishing --- 
+
+  // 1. Publish 3D PointCloud2 (if enabled)
+  if (publish_3d_pcd_)
   {
-      RCLCPP_ERROR(this->get_logger(), "cudaMemcpy (GPU to CPU for ROS publish) failed: %s", cudaGetErrorString(err));
-      cudaFree(d_voxel_filtered_cloud);
-      return;
+    // Copy final GPU cloud back to CPU for ROS publishing
+    pcl::PointCloud<pcl::PointXYZI>::Ptr final_cpu_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+    final_cpu_cloud->points.resize(num_voxel_filtered_points);
+    err = cudaMemcpy(final_cpu_cloud->points.data(), d_voxel_filtered_cloud, 
+                     num_voxel_filtered_points * sizeof(CudaPointXYZI), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess)
+    {
+        RCLCPP_ERROR(this->get_logger(), "cudaMemcpy (GPU to CPU for ROS publish) failed: %s", cudaGetErrorString(err));
+    }
+    else
+    {
+        sensor_msgs::msg::PointCloud2 output_msg;
+        pcl::toROSMsg(*final_cpu_cloud, output_msg);
+        output_msg.header.stamp = this->get_clock()->now();
+        output_msg.header.frame_id = base_frame_id_;
+        merged_pub_->publish(output_msg);
+    }
   }
-  final_cpu_cloud->width = num_voxel_filtered_points;
-  final_cpu_cloud->height = 1;
-  final_cpu_cloud->is_dense = true;
 
-  cudaFree(d_voxel_filtered_cloud); // Free final GPU cloud
+  // 2. Publish FlatScan (LaserScan) (if enabled)
+  if (publish_flatscan_)
+  {
+    CudaLaserScanParams flatscan_params;
+    flatscan_params.angle_min = flatscan_angle_min_;
+    flatscan_params.angle_max = flatscan_angle_max_;
+    flatscan_params.angle_increment = flatscan_angle_increment_;
+    flatscan_params.range_min = flatscan_range_min_;
+    flatscan_params.range_max = flatscan_range_max_;
+    flatscan_params.min_height = flatscan_min_height_;
+    flatscan_params.max_height = flatscan_max_height_;
+    flatscan_params.num_beams = static_cast<size_t>((flatscan_angle_max_ - flatscan_angle_min_) / flatscan_angle_increment_) + 1;
 
-  sensor_msgs::msg::PointCloud2 output_msg;
-  pcl::toROSMsg(*final_cpu_cloud, output_msg);
-  output_msg.header.stamp = this->get_clock()->now();
-  output_msg.header.frame_id = base_frame_id_;
-  merged_pub_->publish(output_msg);
+    float* d_ranges = nullptr;
+    err = generateFlatScanGPU(d_voxel_filtered_cloud, num_voxel_filtered_points, flatscan_params, &d_ranges);
+    if (err != cudaSuccess)
+    {
+        RCLCPP_ERROR(this->get_logger(), "generateFlatScanGPU kernel launch failed: %s", cudaGetErrorString(err));
+        // Continue without publishing flatscan
+    }
+    else
+    {
+        sensor_msgs::msg::LaserScan scan_msg;
+        scan_msg.header.stamp = this->get_clock()->now();
+        scan_msg.header.frame_id = base_frame_id_;
+        scan_msg.angle_min = flatscan_params.angle_min;
+        scan_msg.angle_max = flatscan_params.angle_max;
+        scan_msg.angle_increment = flatscan_params.angle_increment;
+        scan_msg.range_min = flatscan_params.range_min;
+        scan_msg.range_max = flatscan_params.range_max;
+        scan_msg.ranges.resize(flatscan_params.num_beams);
+
+        // Copy ranges from GPU to CPU
+        err = cudaMemcpy(scan_msg.ranges.data(), d_ranges, flatscan_params.num_beams * sizeof(float), cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess)
+        {
+            RCLCPP_ERROR(this->get_logger(), "cudaMemcpy (GPU to CPU for LaserScan) failed: %s", cudaGetErrorString(err));
+        }
+        else
+        {
+            flatscan_pub_->publish(scan_msg);
+        }
+        cudaFree(d_ranges);
+    }
+  }
+
+  // Free the final GPU cloud after all potential uses
+  if (d_voxel_filtered_cloud) cudaFree(d_voxel_filtered_cloud);
 }

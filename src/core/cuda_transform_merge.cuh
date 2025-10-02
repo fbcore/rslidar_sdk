@@ -1,4 +1,3 @@
-
 #ifndef CUDA_TRANSFORM_MERGE_CUH
 #define CUDA_TRANSFORM_MERGE_CUH
 
@@ -10,6 +9,7 @@
 cudaError_t transformAndMergeGPU(
     const std::vector<CudaPointXYZI*>& d_input_clouds,
     const std::vector<size_t>& h_input_counts,
+    const std::vector<size_t>& h_prefix_sums, // New: prefix sums of point counts
     const std::vector<CudaMatrix4f>& h_transforms,
     CudaPointXYZI* d_output_cloud,
     size_t total_output_points);
