@@ -1,5 +1,5 @@
 
-#include "multi_lidar_node.hpp"
+#include "../src/manager/multi_lidar_node.hpp"
 
 int main(int argc, char** argv)
 {
