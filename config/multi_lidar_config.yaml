@@ -1,0 +1,50 @@
+
+# config/multi_lidar_config.yaml
+multi_lidar_node:
+  ros__parameters:
+    # The base frame for the merged point cloud
+    base_frame_id: "base_link"
+    # Topic for the merged point cloud
+    merged_topic_name: "/points_merged"
+    # Publishing frequency in Hz
+    publish_frequency: 10.0
+
+    # List of lidars to be configured
+    lidars:
+      # Name of the first lidar (can be anything)
+      - name: "lidar_front"
+        enabled: true
+        driver:
+          lidar_type: "RS16"
+          input_type: "online"
+          msop_port: 6699
+          difop_port: 7788
+        pointcloud:
+          frame_id: "lidar_front_link"
+        # TF from base_frame_id to this lidar's frame_id
+        tf:
+          x: 0.5
+          y: 0.0
+          z: 0.2
+          roll: 0.0
+          pitch: 0.0
+          yaw: 0.0
+
+      # Name of the second lidar
+      - name: "lidar_rear"
+        enabled: true
+        driver:
+          lidar_type: "RS16"
+          input_type: "online"
+          msop_port: 6700
+          difop_port: 7789
+        pointcloud:
+          frame_id: "lidar_rear_link"
+        # TF from base_frame_id to this lidar's frame_id
+        tf:
+          x: -0.5
+          y: 0.0
+          z: 0.2
+          roll: 0.0
+          pitch: 0.0
+          yaw: 3.14159

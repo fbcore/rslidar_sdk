@@ -141,7 +141,14 @@ if(rclcpp_FOUND)
   find_package(ament_cmake REQUIRED)
   find_package(sensor_msgs REQUIRED)
   find_package(rslidar_msg REQUIRED)
-  find_package(std_msgs REQUIRED)                      
+  find_package(std_msgs REQUIRED)
+  find_package(PCL REQUIRED)
+  find_package(pcl_conversions REQUIRED)
+
+  include_directories(
+    ${PCL_INCLUDE_DIRS}
+    ${pcl_conversions_INCLUDE_DIRS}
+  )
 
 else(rclcpp_FOUND)
   message(=============================================================)
@@ -168,9 +175,21 @@ add_executable(rslidar_sdk_node
                node/rslidar_sdk_node.cpp
                src/manager/node_manager.cpp)
 
+# New executable for multi-lidar processing
+add_executable(multi_lidar_node
+                node/multi_lidar_node.cpp
+                src/manager/multi_lidar_node.cpp)
+
+
 target_link_libraries(rslidar_sdk_node                   
                       ${YAML_CPP_LIBRARIES}
                       ${rs_driver_LIBRARIES})
+
+target_link_libraries(multi_lidar_node
+                      ${YAML_CPP_LIBRARIES}
+                      ${rs_driver_LIBRARIES}
+                      ${PCL_LIBRARIES}
+                      ${pcl_conversions_LIBRARIES})
 
 #Ros#
 if(roscpp_FOUND)
@@ -194,8 +213,17 @@ if(rclcpp_FOUND)
     sensor_msgs 
     rslidar_msg)
 
+  ament_target_dependencies(multi_lidar_node
+    rclcpp
+    std_msgs
+    sensor_msgs
+    rslidar_msg
+    pcl_conversions)
+
+
   install(TARGETS
     rslidar_sdk_node
+    multi_lidar_node
     DESTINATION lib/${PROJECT_NAME})
 
   install(DIRECTORY
