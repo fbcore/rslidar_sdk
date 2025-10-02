@@ -9,6 +9,9 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include "../core/cuda_transform_merge.cuh"
+#include "../core/cuda_roi_filter.cuh"
+#include "../core/cuda_voxel_grid.cuh"
 
 
 MultiLidarNode::MultiLidarNode(const rclcpp::NodeOptions& options)
@@ -60,104 +63,8 @@ void MultiLidarNode::loadParameters()
       Eigen::AngleAxisf rot_z(yaw, Eigen::Vector3f::UnitZ());
       transform = (translation * rot_z * rot_y * rot_x).matrix();
 
-      lidar_handlers_.emplace_back(std::make_shared<LidarHandler>(driver_param, transform));
+      lidar_handlers_.emplace_back(std::make_shared<GPULidarHandler>(driver_param, transform));
       RCLCPP_INFO(this->get_logger(), "Initialized lidar: %s", this->declare_parameter(lidar_prefix + "name", "").c_str());
-  }
-}
-
-void MultiLidarNode::mergeAndPublish()
-{
-  pcl::PointCloud<pcl::PointXYZI> merged_cloud;
-
-  for (const auto& handler : lidar_handlers_)
-  {
-    auto cloud_msg = handler->getPointCloud();
-    if (cloud_msg)
-    {
-      pcl::PointCloud<pcl::PointXYZI> cloud_part;
-      // This is a simplified conversion. You may need a proper converter 
-      // depending on the exact point cloud format from the driver.
-      for (const auto& p : cloud_msg->points)
-      {
-          pcl::PointXYZI new_point;
-          new_point.x = p.x;
-          new_point.y = p.y;
-          new_point.z = p.z;
-          new_point.intensity = p.intensity;
-          cloud_part.points.push_back(new_point);
-      }
-
-      pcl::PointCloud<pcl::PointXYZI> transformed_cloud;
-      pcl::transformPointCloud(cloud_part, transformed_cloud, handler->getTransform());
-      merged_cloud += transformed_cloud;
-    }
-  }
-
-  if (!merged_cloud.empty())
-  {
-    pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-    *filtered_cloud = merged_cloud;
-
-    // 1. Apply ROI Filters (multiple positive/negative with priority)
-    if (enable_roi_filter_ && !filtered_cloud->empty() && !roi_filters_.empty())
-    {
-      pcl::PointCloud<pcl::PointXYZI>::Ptr roi_filtered_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-      for (const auto& point : filtered_cloud->points)
-      {
-        bool in_any_positive_box = false;
-        bool in_any_negative_box = false;
-
-        for (const auto& filter_config : roi_filters_)
-        {
-          bool in_box = (point.x >= filter_config.min_x && point.x <= filter_config.max_x &&
-                         point.y >= filter_config.min_y && point.y <= filter_config.max_y &&
-                         point.z >= filter_config.min_z && point.z <= filter_config.max_z);
-
-          if (in_box)
-          {
-            if (filter_config.type == "positive")
-            {
-              in_any_positive_box = true;
-            }
-            else if (filter_config.type == "negative")
-            {
-              in_any_negative_box = true;
-            }
-          }
-        }
-
-        // Priority logic: If in any positive box, keep. Else if not in any negative box, keep.
-        if (in_any_positive_box || (!in_any_negative_box && !in_any_positive_box))
-        {
-          roi_filtered_cloud->points.push_back(point);
-        }
-      }
-      roi_filtered_cloud->width = roi_filtered_cloud->points.size();
-      roi_filtered_cloud->height = 1;
-      roi_filtered_cloud->is_dense = true;
-      filtered_cloud = roi_filtered_cloud;
-    }
-
-    // 2. Apply Voxel Grid Filter
-    if (enable_voxel_filter_ && !filtered_cloud->empty())
-    {
-      pcl::VoxelGrid<pcl::PointXYZI> voxel_filter;
-      voxel_filter.setInputCloud(filtered_cloud);
-      voxel_filter.setLeafSize(voxel_leaf_size_, voxel_leaf_size_, voxel_leaf_size_);
-      voxel_filter.filter(*filtered_cloud);
-    }
-
-    if (filtered_cloud->empty())
-    {
-      RCLCPP_WARN(this->get_logger(), "Filtered cloud is empty. Not publishing.");
-      return;
-    }
-
-    sensor_msgs::msg::PointCloud2 output_msg;
-    pcl::toROSMsg(*filtered_cloud, output_msg);
-    output_msg.header.stamp = this->get_clock()->now();
-    output_msg.header.frame_id = base_frame_id_;
-    merged_pub_->publish(output_msg);
   }
 }
 
@@ -207,12 +114,12 @@ void MultiLidarNode::runInitialCalibration()
 
   RCLCPP_INFO(this->get_logger(), "[ICP Calibration] Starting initial ICP calibration...");
 
-  std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> initial_clouds(lidar_handlers_.size());
+  std::vector<pcl::PointCloud<pcl::PointXYZI>::Ptr> initial_cpu_clouds(lidar_handlers_.size());
   std::vector<bool> cloud_received(lidar_handlers_.size(), false);
   auto start_time = std::chrono::high_resolution_clock::now();
   const std::chrono::seconds timeout(15); // 15 seconds to collect initial clouds
 
-  // 1. Collect initial point clouds from all LiDARs
+  // 1. Collect initial point clouds from all LiDARs (copy from GPU to CPU for PCL ICP)
   while (std::any_of(cloud_received.begin(), cloud_received.end(), [](bool b){ return !b; }))
   {
     auto current_time = std::chrono::high_resolution_clock::now();
@@ -226,24 +133,26 @@ void MultiLidarNode::runInitialCalibration()
     {
       if (!cloud_received[i])
       {
-        auto cloud_msg = lidar_handlers_[i]->getPointCloud();
-        if (cloud_msg && !cloud_msg->points.empty())
+        auto gpu_cloud_data = lidar_handlers_[i]->getGPUPointCloud();
+        if (gpu_cloud_data && gpu_cloud_data->d_points_ptr && gpu_cloud_data->num_points > 0)
         {
           pcl::PointCloud<pcl::PointXYZI>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZI>);
-          for (const auto& p : cloud_msg->points)
+          pcl_cloud->points.resize(gpu_cloud_data->num_points);
+
+          // Copy from GPU to CPU for PCL ICP
+          cudaError_t err = cudaMemcpy(pcl_cloud->points.data(), gpu_cloud_data->d_points_ptr.get(), 
+                                       gpu_cloud_data->num_points * sizeof(CudaPointXYZI), cudaMemcpyDeviceToHost);
+          if (err != cudaSuccess)
           {
-            pcl::PointXYZI new_point;
-            new_point.x = p.x;
-            new_point.y = p.y;
-            new_point.z = p.z;
-            new_point.intensity = p.intensity;
-            pcl_cloud->points.push_back(new_point);
+              RCLCPP_ERROR(this->get_logger(), "cudaMemcpy (GPU to CPU for ICP) failed: %s", cudaGetErrorString(err));
+              continue;
           }
+
           pcl_cloud->width = pcl_cloud->points.size();
           pcl_cloud->height = 1;
           pcl_cloud->is_dense = true;
 
-          initial_clouds[i] = pcl_cloud;
+          initial_cpu_clouds[i] = pcl_cloud;
           cloud_received[i] = true;
           RCLCPP_INFO(this->get_logger(), "[ICP Calibration] Received initial cloud from LiDAR %zu.", i);
         }
@@ -255,14 +164,14 @@ void MultiLidarNode::runInitialCalibration()
   RCLCPP_INFO(this->get_logger(), "[ICP Calibration] All initial point clouds collected. Proceeding with ICP.");
 
   // 2. Perform ICP for each source LiDAR against the first LiDAR (target)
-  pcl::PointCloud<pcl::PointXYZI>::Ptr target_cloud = initial_clouds[0];
+  pcl::PointCloud<pcl::PointXYZI>::Ptr target_cloud = initial_cpu_clouds[0];
   // The transform of the target LiDAR (lidar_handlers_[0]) relative to base_link
   Eigen::Matrix4f base_to_target_tf = lidar_handlers_[0]->getTransform();
 
   for (size_t i = 1; i < lidar_handlers_.size(); ++i)
   {
-    pcl::PointCloud<pcl::PointXYZI>::Ptr source_cloud = initial_clouds[i];
-    std::shared_ptr<LidarHandler> source_handler = lidar_handlers_[i];
+    pcl::PointCloud<pcl::PointXYZI>::Ptr source_cloud = initial_cpu_clouds[i];
+    std::shared_ptr<GPULidarHandler> source_handler = lidar_handlers_[i];
 
     // Get the initial guess for source_lidar_link to base_link
     Eigen::Matrix4f initial_source_to_base_tf = source_handler->getTransform();
@@ -302,4 +211,136 @@ void MultiLidarNode::runInitialCalibration()
     }
   }
   RCLCPP_INFO(this->get_logger(), "[ICP Calibration] Initial ICP calibration finished.");
+}
+
+void MultiLidarNode::mergeAndPublish()
+{
+  std::vector<CudaPointXYZI*> d_input_clouds;
+  std::vector<size_t> h_input_counts;
+  std::vector<CudaMatrix4f> h_transforms;
+  size_t total_points_to_merge = 0;
+
+  for (const auto& handler : lidar_handlers_)
+  {
+    auto gpu_cloud_data = handler->getGPUPointCloud();
+    if (gpu_cloud_data && gpu_cloud_data->d_points_ptr && gpu_cloud_data->num_points > 0)
+    {
+      d_input_clouds.push_back(gpu_cloud_data->d_points_ptr.get());
+      h_input_counts.push_back(gpu_cloud_data->num_points);
+      total_points_to_merge += gpu_cloud_data->num_points;
+
+      CudaMatrix4f cuda_transform;
+      cuda_transform.fromEigen(handler->getTransform().data());
+      h_transforms.push_back(cuda_transform);
+    }
+  }
+
+  if (total_points_to_merge == 0)
+  {
+    RCLCPP_WARN(this->get_logger(), "No points to merge. Not publishing.");
+    return;
+  }
+
+  CudaPointXYZI* d_merged_cloud = nullptr;
+  cudaError_t err = cudaMalloc((void**)&d_merged_cloud, total_points_to_merge * sizeof(CudaPointXYZI));
+  if (err != cudaSuccess)
+  {
+      RCLCPP_ERROR(this->get_logger(), "cudaMalloc for merged cloud failed: %s", cudaGetErrorString(err));
+      return;
+  }
+
+  // Launch CUDA kernel for transform and merge
+  err = transformAndMergeGPU(d_input_clouds, h_input_counts, h_transforms, d_merged_cloud, total_points_to_merge);
+  if (err != cudaSuccess)
+  {
+      RCLCPP_ERROR(this->get_logger(), "transformAndMergeGPU kernel launch failed: %s", cudaGetErrorString(err));
+      cudaFree(d_merged_cloud);
+      return;
+  }
+
+  CudaPointXYZI* d_roi_filtered_cloud = nullptr;
+  size_t num_roi_filtered_points = 0;
+
+  // 1. Apply ROI Filters (multiple positive/negative with priority) on GPU
+  if (enable_roi_filter_ && !roi_filters_.empty())
+  {
+    std::vector<CudaRoiFilterConfig> h_cuda_roi_filters;
+    for (const auto& config : roi_filters_)
+    {
+      CudaRoiFilterConfig cuda_config;
+      cuda_config.min_x = config.min_x; cuda_config.max_x = config.max_x;
+      cuda_config.min_y = config.min_y; cuda_config.max_y = config.max_y;
+      cuda_config.min_z = config.min_z; cuda_config.max_z = config.max_z;
+      cuda_config.type = (config.type == "positive") ? 0 : 1;
+      h_cuda_roi_filters.push_back(cuda_config);
+    }
+
+    err = roiFilterGPU(d_merged_cloud, total_points_to_merge,
+                       h_cuda_roi_filters.data(), h_cuda_roi_filters.size(),
+                       &d_roi_filtered_cloud, &num_roi_filtered_points);
+    if (err != cudaSuccess)
+    {
+        RCLCPP_ERROR(this->get_logger(), "roiFilterGPU kernel launch failed: %s", cudaGetErrorString(err));
+        cudaFree(d_merged_cloud);
+        return;
+    }
+    cudaFree(d_merged_cloud); // Free merged cloud after filtering
+  }
+  else
+  {
+    d_roi_filtered_cloud = d_merged_cloud; // No ROI filter, pass through
+    num_roi_filtered_points = total_points_to_merge;
+  }
+
+  CudaPointXYZI* d_voxel_filtered_cloud = nullptr;
+  size_t num_voxel_filtered_points = 0;
+
+  // 2. Apply Voxel Grid Filter on GPU
+  if (enable_voxel_filter_ && num_roi_filtered_points > 0)
+  {
+    err = voxelGridDownsampleGPU(d_roi_filtered_cloud, num_roi_filtered_points,
+                                 voxel_leaf_size_, &d_voxel_filtered_cloud, &num_voxel_filtered_points);
+    if (err != cudaSuccess)
+    {
+        RCLCPP_ERROR(this->get_logger(), "voxelGridDownsampleGPU kernel launch failed: %s", cudaGetErrorString(err));
+        cudaFree(d_roi_filtered_cloud);
+        return;
+    }
+    cudaFree(d_roi_filtered_cloud); // Free ROI filtered cloud after voxel filtering
+  }
+  else
+  {
+    d_voxel_filtered_cloud = d_roi_filtered_cloud; // No Voxel filter, pass through
+    num_voxel_filtered_points = num_roi_filtered_points;
+  }
+
+  if (num_voxel_filtered_points == 0)
+  {
+    RCLCPP_WARN(this->get_logger(), "Final filtered cloud is empty. Not publishing.");
+    if (d_voxel_filtered_cloud) cudaFree(d_voxel_filtered_cloud);
+    return;
+  }
+
+  // Copy final GPU cloud back to CPU for ROS publishing
+  pcl::PointCloud<pcl::PointXYZI>::Ptr final_cpu_cloud(new pcl::PointCloud<pcl::PointXYZI>);
+  final_cpu_cloud->points.resize(num_voxel_filtered_points);
+  err = cudaMemcpy(final_cpu_cloud->points.data(), d_voxel_filtered_cloud, 
+                   num_voxel_filtered_points * sizeof(CudaPointXYZI), cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess)
+  {
+      RCLCPP_ERROR(this->get_logger(), "cudaMemcpy (GPU to CPU for ROS publish) failed: %s", cudaGetErrorString(err));
+      cudaFree(d_voxel_filtered_cloud);
+      return;
+  }
+  final_cpu_cloud->width = num_voxel_filtered_points;
+  final_cpu_cloud->height = 1;
+  final_cpu_cloud->is_dense = true;
+
+  cudaFree(d_voxel_filtered_cloud); // Free final GPU cloud
+
+  sensor_msgs::msg::PointCloud2 output_msg;
+  pcl::toROSMsg(*final_cpu_cloud, output_msg);
+  output_msg.header.stamp = this->get_clock()->now();
+  output_msg.header.frame_id = base_frame_id_;
+  merged_pub_->publish(output_msg);
 }

@@ -101,13 +101,13 @@ if(roscpp_FOUND)
   message("-- ROS Found. ROS Support is turned On.")
   message(=============================================================)
 
-  add_definitions(-DROS_FOUND)
+  add_definitions("-DROS_FOUND")
 
   find_package(roslib QUIET)
   include_directories(${roscpp_INCLUDE_DIRS} ${roslib_INCLUDE_DIRS})
   set(ROS_LIBS ${roscpp_LIBRARIES} ${roslib_LIBRARIES})
 
-  add_definitions(-DRUN_IN_ROS_WORKSPACE)
+  add_definitions("-DRUN_IN_ROS_WORKSPACE")
 
   find_package(catkin REQUIRED COMPONENTS
     roscpp
@@ -134,7 +134,7 @@ if(rclcpp_FOUND)
   message("-- ROS2 Found. ROS2 Support is turned On.")
   message(=============================================================)
 
-  add_definitions(-DROS2_FOUND)
+  add_definitions("-DROS2_FOUND")
   include_directories(${rclcpp_INCLUDE_DIRS})
   set(CMAKE_CXX_STANDARD 14)
 
@@ -144,10 +144,13 @@ if(rclcpp_FOUND)
   find_package(std_msgs REQUIRED)
   find_package(PCL REQUIRED)
   find_package(pcl_conversions REQUIRED)
+  find_package(CUDA REQUIRED)
 
   include_directories(
     ${PCL_INCLUDE_DIRS}
     ${pcl_conversions_INCLUDE_DIRS}
+    ${PROJECT_SOURCE_DIR}/src/core
+    ${CUDA_INCLUDE_DIRS}
   )
 
 else(rclcpp_FOUND)
@@ -178,7 +181,10 @@ add_executable(rslidar_sdk_node
 # New executable for multi-lidar processing
 add_executable(multi_lidar_node
                 node/multi_lidar_node.cpp
-                src/manager/multi_lidar_node.cpp)
+                src/manager/multi_lidar_node.cpp
+                src/core/cuda_transform_merge.cu
+                src/core/cuda_roi_filter.cu
+                src/core/cuda_voxel_grid.cu)
 
 
 target_link_libraries(rslidar_sdk_node                   
@@ -189,7 +195,8 @@ target_link_libraries(multi_lidar_node
                       ${YAML_CPP_LIBRARIES}
                       ${rs_driver_LIBRARIES}
                       ${PCL_LIBRARIES}
-                      ${pcl_conversions_LIBRARIES})
+                      ${pcl_conversions_LIBRARIES}
+                      ${CUDA_LIBRARIES})
 
 #Ros#
 if(roscpp_FOUND)
@@ -234,4 +241,3 @@ if(rclcpp_FOUND)
   ament_package()
 
 endif(rclcpp_FOUND)
-

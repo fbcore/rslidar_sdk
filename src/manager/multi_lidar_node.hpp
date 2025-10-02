@@ -6,7 +6,7 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/common/transforms.h>
-#include "lidar_handler.hpp"
+#include "gpu_lidar_handler.hpp" // Use GPULidarHandler
 
 // Struct to hold a single ROI filter configuration
 struct RoiFilterConfig
@@ -27,7 +27,7 @@ private:
   void mergeAndPublish();
   void runInitialCalibration();
 
-  std::vector<std::shared_ptr<LidarHandler>> lidar_handlers_;
+  std::vector<std::shared_ptr<GPULidarHandler>> lidar_handlers_; // Use GPULidarHandler
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr merged_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
