@@ -79,7 +79,10 @@ cudaError_t transformAndMergeGPU(
     if (err != cudaSuccess) { cudaFree(d_input_clouds); cudaFree(d_input_counts_ptr); cudaFree(d_prefix_sums_ptr); cudaFree(d_transforms_ptr); return err; }
 
     // Launch kernel
-    const int BLOCK_SIZE = 256;
+    int min_grid_size;
+    int block_size;
+    cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, transformAndMergeKernel, 0, 0);
+    const int BLOCK_SIZE = block_size;
     int num_blocks = (total_output_points + BLOCK_SIZE - 1) / BLOCK_SIZE;
     transformAndMergeKernel<<<num_blocks, BLOCK_SIZE>>>(
         d_input_clouds, d_input_counts_ptr, d_prefix_sums_ptr, d_transforms_ptr, h_input_clouds.size(), d_output_cloud);
@@ -90,7 +93,8 @@ cudaError_t transformAndMergeGPU(
     {
         fprintf(stderr, "CUDA kernel launch failed: %s\n", cudaGetErrorString(err));
     }
-
+    err = cudaDeviceSynchronize();
+    
     // Free device memory for temporary arrays
     cudaFree(d_input_clouds);
     cudaFree(d_input_counts_ptr);

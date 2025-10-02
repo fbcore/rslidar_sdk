@@ -1,6 +1,5 @@
 # 1 **rslidar_sdk**
 
- [中文介绍](README_CN.md)
 
 ## 1 Introduction
 
@@ -170,3 +169,46 @@ Below are some quick guides to use rslidar_sdk.
 [Record rosbag &amp; Replay it](doc/howto/11_how_to_record_replay_packet_rosbag.md)
 
 [Solution for ROS2_humble frame rate reduction](doc/howto/13_how_to_solve_ROS2_humble_frame_rate_drop.md)
+
+## 8 Multi-LiDAR Support
+
+The `rslidar_sdk` provides robust support for integrating and processing data from multiple RoboSense LiDARs simultaneously. This feature allows for merging point clouds from various sensors into a single, unified point cloud, applying individual transformations, and utilizing advanced filtering techniques.
+
+### 8.1 Launching Multi-LiDAR Node
+
+To launch the multi-LiDAR processing node, use the dedicated ROS2 launch file:
+
+```sh
+ros2 launch rslidar_sdk multi_lidar_start.py
+```
+
+This launch file automatically loads the multi-LiDAR configuration from `config/multi_lidar_config.yaml`.
+
+### 8.2 Configuration
+
+Multi-LiDAR behavior is configured via the `config/multi_lidar_config.yaml` file. This file defines parameters for:
+
+*   **Merged Point Cloud Output**:
+    *   `base_frame_id`: The reference frame for the merged point cloud.
+    *   `merged_topic_name`: The ROS2 topic where the merged point cloud will be published.
+    *   `publish_3d_pcd`: Enable/disable publishing of the 3D merged point cloud.
+    *   `publish_frequency`: The publishing frequency of the merged point cloud.
+
+*   **Filtering**:
+    *   `enable_roi_filter`: Enable/disable Region of Interest (ROI) filtering.
+    *   `roi_filters`: A list of ROI filter configurations, allowing for positive (keep points inside) and negative (remove points inside) filtering based on 3D bounding boxes.
+    *   `enable_voxel_filter`: Enable/disable Voxel Grid downsampling.
+    *   `voxel_leaf_size`: The leaf size for the voxel grid filter.
+    *   `publish_flatscan`: Enable/disable publishing of 2D LaserScan data derived from the merged point cloud.
+    *   `flatscan_topic_name`: The ROS2 topic for the 2D LaserScan.
+    *   `flatscan_min_height`, `flatscan_max_height`, `flatscan_angle_min`, `flatscan_angle_max`, `flatscan_angle_increment`, `flatscan_range_min`, `flatscan_range_max`: Parameters for generating the 2D LaserScan.
+
+*   **Individual LiDAR Configuration (`lidars` array)**:
+    Each entry in the `lidars` array represents a single LiDAR sensor and includes:
+    *   `name`: A unique identifier for the LiDAR.
+    *   `enabled`: Whether this LiDAR's data should be processed.
+    *   `driver`: Specific driver settings for the LiDAR, such as `lidar_type`, `input_type` (e.g., "online"), `msop_port`, and `difop_port`.
+    *   `pointcloud`: Point cloud specific settings, like `frame_id` for the individual LiDAR's point cloud.
+    *   `tf`: The 6-DOF (x, y, z, roll, pitch, yaw) transformation from the `base_frame_id` to this individual LiDAR's `frame_id`. This is crucial for accurate point cloud merging.
+
+Refer to `config/multi_lidar_config.yaml` for detailed examples and parameter descriptions.

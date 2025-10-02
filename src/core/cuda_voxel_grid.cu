@@ -1,5 +1,6 @@
 
 #include "cuda_voxel_grid.cuh"
+#include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
 #include <thrust/unique.h>
@@ -57,7 +58,12 @@ cudaError_t voxelGridDownsampleGPU(
     }
 
     cudaError_t err;
-    const int BLOCK_SIZE = 256;
+
+    int min_grid_size;
+    int block_size;
+    cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, computeVoxelIDsKernel, 0, 0);
+    const int BLOCK_SIZE = block_size;
+
     int num_blocks = (num_input_points + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // 1. Compute Voxel IDs
@@ -66,7 +72,8 @@ cudaError_t voxelGridDownsampleGPU(
         d_input_cloud, num_input_points, 1.0f / leaf_size, thrust::raw_pointer_cast(d_voxel_points.data()));
     err = cudaGetLastError();
     if (err != cudaSuccess) return err;
-
+    err = cudaDeviceSynchronize();
+    
     // 2. Sort by Voxel ID
     thrust::sort(thrust::device, d_voxel_points.begin(), d_voxel_points.end());
 

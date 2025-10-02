@@ -61,7 +61,11 @@ cudaError_t generateFlatScanGPU(
     err = cudaMalloc((void**)&d_ranges, params.num_beams * sizeof(float));
     if (err != cudaSuccess) return err;
 
-    const int BLOCK_SIZE = 256;
+    int min_grid_size;
+    int block_size;
+    cudaOccupancyMaxPotentialBlockSize(&min_grid_size, &block_size, generateFlatScanKernel, 0, 0);
+    const int BLOCK_SIZE = block_size;
+
     int num_blocks_init = (params.num_beams + BLOCK_SIZE - 1) / BLOCK_SIZE;
     initRangesKernel<<<num_blocks_init, BLOCK_SIZE>>>(d_ranges, params.num_beams);
     err = cudaGetLastError();
