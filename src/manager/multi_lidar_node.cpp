@@ -13,6 +13,8 @@
 #include "../core/cuda_roi_filter.cuh"
 #include "../core/cuda_voxel_grid.cuh"
 #include "../core/cuda_flatscan.cuh"
+#include <tf2_eigen/tf2_eigen.h>
+#include <tf2/exceptions.h>
 
 
 MultiLidarNode::MultiLidarNode(const rclcpp::NodeOptions& options)
@@ -27,6 +29,16 @@ MultiLidarNode::MultiLidarNode(const rclcpp::NodeOptions& options)
   timer_ = this->create_wall_timer(
       std::chrono::milliseconds(static_cast<int>(1000.0 / publish_frequency)),
       std::bind(&MultiLidarNode::mergeAndPublish, this));
+
+  param_callback_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&MultiLidarNode::parametersCallback, this, std::placeholders::_1));
+
+  tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+  tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+  tf_check_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(100), // 10Hz
+      std::bind(&MultiLidarNode::checkTfUpdates, this));
 }
 
 void MultiLidarNode::loadParameters()
@@ -39,6 +51,15 @@ void MultiLidarNode::loadParameters()
     merged_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(merged_topic_name, 10);
   }
 
+  bool publish_nitros = this->declare_parameter("publish_nitros", false);
+  if (publish_nitros)
+  {
+    nitros_pub_ = std::make_shared<nvidia::isaac_ros::nitros::ManagedNitrosPublisher<nvidia::isaac_ros::nitros::NitrosPointCloud2>>(
+      this,
+      "nitros_points_merged",
+      nvidia::isaac_ros::nitros::NitrosPointCloud2::supported_type_names);
+  }
+
   auto lidar_params = this->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
   
   // This is a workaround to get nested parameters (a list of structs)
@@ -48,6 +69,10 @@ void MultiLidarNode::loadParameters()
       std::string lidar_prefix = "lidars." + std::to_string(i) + ".";
       bool enabled = this->declare_parameter(lidar_prefix + "enabled", false);
       if (!enabled) continue;
+
+      std::string lidar_name = this->declare_parameter(lidar_prefix + "name", "");
+      std::string frame_id = this->declare_parameter(lidar_prefix + "frame_id", lidar_name);
+      lidar_frame_ids_.push_back(frame_id);
 
       RsDriverParam driver_param;
       driver_param.lidar_type = (LidarType)this->declare_parameter(lidar_prefix + "driver.lidar_type", (int)LidarType::RS16);
@@ -387,6 +412,18 @@ void MultiLidarNode::mergeAndPublish()
         output_msg.header.stamp = this->get_clock()->now();
         output_msg.header.frame_id = base_frame_id_;
         merged_pub_->publish(output_msg);
+
+        if (nitros_pub_)
+        {
+          auto nitros_output_msg = output_msg;
+          nvidia::isaac_ros::nitros::NitrosPointCloud2 nitros_msg =
+            nvidia::isaac_ros::nitros::NitrosPointCloud2Builder()
+            .With(
+              std::move(nitros_output_msg)
+            )
+            .Build();
+          nitros_pub_->publish(nitros_msg);
+        }
     }
   }
 
@@ -438,4 +475,123 @@ void MultiLidarNode::mergeAndPublish()
 
   // Free the final GPU cloud after all potential uses
   if (d_voxel_filtered_cloud) cudaFree(d_voxel_filtered_cloud);
+}
+
+rcl_interfaces::msg::SetParametersResult MultiLidarNode::parametersCallback(const std::vector<rclcpp::Parameter> &parameters)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  for (const auto &parameter : parameters)
+  {
+    std::string name = parameter.get_name();
+    std::string prefix = "lidars.";
+
+    if (name.rfind(prefix, 0) == 0)
+    {
+      size_t dot_pos = name.find(".", prefix.length());
+      if (dot_pos != std::string::npos)
+      {
+        std::string index_str = name.substr(prefix.length(), dot_pos - prefix.length());
+        try
+        {
+          size_t lidar_index = std::stoul(index_str);
+          if (lidar_index < lidar_handlers_.size())
+          {
+            std::string tf_prefix = prefix + index_str + ".tf.";
+            if (name.rfind(tf_prefix, 0) == 0)
+            {
+              double x = this->get_parameter(tf_prefix + "x").as_double();
+              double y = this->get_parameter(tf_prefix + "y").as_double();
+              double z = this->get_parameter(tf_prefix + "z").as_double();
+              double roll = this->get_parameter(tf_prefix + "roll").as_double();
+              double pitch = this->get_parameter(tf_prefix + "pitch").as_double();
+              double yaw = this->get_parameter(tf_prefix + "yaw").as_double();
+
+              if (name == tf_prefix + "x") x = parameter.as_double();
+              if (name == tf_prefix + "y") y = parameter.as_double();
+              if (name == tf_prefix + "z") z = parameter.as_double();
+              if (name == tf_prefix + "roll") roll = parameter.as_double();
+              if (name == tf_prefix + "pitch") pitch = parameter.as_double();
+              if (name == tf_prefix + "yaw") yaw = parameter.as_double();
+
+              Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
+              Eigen::Translation3f translation(x, y, z);
+              Eigen::AngleAxisf rot_x(roll, Eigen::Vector3f::UnitX());
+              Eigen::AngleAxisf rot_y(pitch, Eigen::Vector3f::UnitY());
+              Eigen::AngleAxisf rot_z(yaw, Eigen::Vector3f::UnitZ());
+              transform = (translation * rot_z * rot_y * rot_x).matrix();
+
+              lidar_handlers_[lidar_index]->setTransform(transform);
+              RCLCPP_INFO(this->get_logger(), "Updated TF for lidar %zu", lidar_index);
+            }
+          }
+        }
+        catch (const std::exception &e)
+        {
+          RCLCPP_WARN(this->get_logger(), "Could not parse lidar index from parameter name: %s", name.c_str());
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+void MultiLidarNode::checkTfUpdates()
+{
+  for (size_t i = 0; i < lidar_frame_ids_.size(); ++i)
+  {
+    if (lidar_frame_ids_[i].empty())
+    {
+      continue;
+    }
+
+    try
+    {
+      geometry_msgs::msg::TransformStamped transform_stamped = tf_buffer_->lookupTransform(
+        base_frame_id_, lidar_frame_ids_[i], tf2::TimePointZero);
+
+      // Convert transform to roll, pitch, yaw and x, y, z
+      tf2::Quaternion q(transform_stamped.transform.rotation.x,
+                        transform_stamped.transform.rotation.y,
+                        transform_stamped.transform.rotation.z,
+                        transform_stamped.transform.rotation.w);
+      tf2::Matrix3x3 m(q);
+      double roll, pitch, yaw;
+      m.getRPY(roll, pitch, yaw);
+
+      double x = transform_stamped.transform.translation.x;
+      double y = transform_stamped.transform.translation.y;
+      double z = transform_stamped.transform.translation.z;
+
+      // Get current parameters
+      std::string tf_prefix = "lidars." + std::to_string(i) + ".tf.";
+      double current_x = this->get_parameter(tf_prefix + "x").as_double();
+      double current_y = this->get_parameter(tf_prefix + "y").as_double();
+      double current_z = this->get_parameter(tf_prefix + "z").as_double();
+      double current_roll = this->get_parameter(tf_prefix + "roll").as_double();
+      double current_pitch = this->get_parameter(tf_prefix + "pitch").as_double();
+      double current_yaw = this->get_parameter(tf_prefix + "yaw").as_double();
+
+      // Check if parameters need to be updated
+      if (std::abs(current_x - x) > 1e-6 || std::abs(current_y - y) > 1e-6 || std::abs(current_z - z) > 1e-6 ||
+          std::abs(current_roll - roll) > 1e-6 || std::abs(current_pitch - pitch) > 1e-6 || std::abs(current_yaw - yaw) > 1e-6)
+      {
+        this->set_parameters({
+          rclcpp::Parameter(tf_prefix + "x", x),
+          rclcpp::Parameter(tf_prefix + "y", y),
+          rclcpp::Parameter(tf_prefix + "z", z),
+          rclcpp::Parameter(tf_prefix + "roll", roll),
+          rclcpp::Parameter(tf_prefix + "pitch", pitch),
+          rclcpp::Parameter(tf_prefix + "yaw", yaw)
+        });
+        RCLCPP_INFO(this->get_logger(), "Updated parameters for lidar %zu from TF.", i);
+      }
+    }
+    catch (const tf2::TransformException &ex)
+    {
+      //RCLCPP_WARN(this->get_logger(), "Could not get transform for %s: %s", lidar_frame_ids_[i].c_str(), ex.what());
+    }
+  }
 }

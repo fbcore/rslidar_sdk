@@ -212,3 +212,51 @@ Multi-LiDAR behavior is configured via the `config/multi_lidar_config.yaml` file
     *   `tf`: The 6-DOF (x, y, z, roll, pitch, yaw) transformation from the `base_frame_id` to this individual LiDAR's `frame_id`. This is crucial for accurate point cloud merging.
 
 Refer to `config/multi_lidar_config.yaml` for detailed examples and parameter descriptions.
+
+### 8.3 Dynamic Configuration
+
+The multi-LiDAR node supports dynamic reconfiguration of LiDAR transformations and offers hardware-accelerated publishing options.
+
+#### 8.3.1 Dynamic TF by Parameter Change
+
+You can dynamically update the transformation (TF) of each LiDAR at runtime by modifying its TF parameters. This is useful for fine-tuning calibration without restarting the node.
+
+To change the `x` position of the first LiDAR (index 0), you can use the following command:
+
+```sh
+ros2 param set /multi_lidar_node lidars.0.tf.x 1.2
+```
+
+The node will automatically detect the change and apply the new transformation to the corresponding LiDAR.
+
+#### 8.3.2 Dynamic TF by TF Topic
+
+The node can also automatically update LiDAR transformations by listening to the TF tree. If you have an external calibration system that broadcasts TF updates, the node can subscribe to these changes.
+
+To enable this feature, specify the `frame_id` for each LiDAR in the `config/multi_lidar_config.yaml` file. This `frame_id` should match the `child_frame_id` in the TF messages.
+
+```yaml
+lidars:
+  - name: "lidar1"
+    frame_id: "lidar1_link" # The node will listen for TF updates for this frame
+    # ... other parameters
+```
+
+When a new transform for `lidar1_link` relative to the `base_frame_id` is published, the node will update its internal parameters and apply the new transformation.
+
+#### 8.3.3 Nitros Publisher
+
+For users with NVIDIA hardware, the node includes an experimental option to publish the merged point cloud using `isaac_ros::nitros::NitrosPublisher`. This can provide significant performance improvements through hardware acceleration.
+
+To enable the Nitros publisher, set the `publish_nitros` parameter to `true` in your configuration file:
+
+```yaml
+multi_lidar_node:
+  ros__parameters:
+    publish_nitros: true
+    # ... other parameters
+```
+
+When enabled, the merged point cloud will be published on the `/nitros_points_merged` topic.
+
+**Note:** This feature requires a compatible Isaac ROS environment and may require additional setup for optimal performance.

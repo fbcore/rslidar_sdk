@@ -8,6 +8,10 @@
 #include <pcl/point_types.h>
 #include <pcl/common/transforms.h>
 #include "gpu_lidar_handler.hpp"
+#include <isaac_ros_nitros/managed_nitros_publisher.hpp>
+#include <isaac_ros_nitros_point_cloud_type/nitros_point_cloud2.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 // Struct to hold a single ROI filter configuration
 struct RoiFilterConfig
@@ -27,13 +31,21 @@ private:
   void loadFilterParameters();
   void loadFlatScanParameters(); // New function to load FlatScan parameters
   void mergeAndPublish();
+  void checkTfUpdates();
   void runInitialCalibration();
+  rcl_interfaces::msg::SetParametersResult parametersCallback(const std::vector<rclcpp::Parameter> &parameters);
 
   std::vector<std::shared_ptr<GPULidarHandler>> lidar_handlers_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr merged_pub_;
+  std::shared_ptr<nvidia::isaac_ros::nitros::ManagedNitrosPublisher<nvidia::isaac_ros::nitros::NitrosPointCloud2>> nitros_pub_;
   bool publish_3d_pcd_; // New member variable
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr flatscan_pub_; // LaserScan publisher
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp::TimerBase::SharedPtr tf_check_timer_;
+  rclcpp::Node::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  std::vector<std::string> lidar_frame_ids_;
 
   std::string base_frame_id_;
 
