@@ -39,6 +39,16 @@ if(${ENABLE_STAMP_WITH_LOCAL})
   add_definitions("-DENABLE_STAMP_WITH_LOCAL")
 endif(${ENABLE_STAMP_WITH_LOCAL})
 
+option(WITH_NITROS "Enable Isaac ROS Nitros support" OFF)
+if(WITH_NITROS)
+  message(=============================================================)
+  message("-- Isaac ROS Nitros support is turned On.")
+  message(=============================================================)
+  add_definitions(-DWITH_NITROS)
+  find_package(isaac_ros_nitros REQUIRED)
+  find_package(isaac_ros_nitros_point_cloud_type REQUIRED)
+endif(WITH_NITROS)
+
 
 option(ENABLE_SOURCE_PACKET_LEGACY "Enable ROS Source of MSOP/DIFOP Packet v1.3.x" OFF)
 if(${ENABLE_SOURCE_PACKET_LEGACY})
@@ -227,6 +237,12 @@ if(rclcpp_FOUND)
     sensor_msgs
     rslidar_msg
     pcl_conversions)
+
+  if(WITH_NITROS)
+    ament_target_dependencies(multi_lidar_node
+      isaac_ros_nitros
+      isaac_ros_nitros_point_cloud_type)
+  endif(WITH_NITROS)
 
 
   install(TARGETS

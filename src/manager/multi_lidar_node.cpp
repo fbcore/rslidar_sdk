@@ -51,6 +51,7 @@ void MultiLidarNode::loadParameters()
     merged_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(merged_topic_name, 10);
   }
 
+#ifdef WITH_NITROS
   bool publish_nitros = this->declare_parameter("publish_nitros", false);
   if (publish_nitros)
   {
@@ -59,6 +60,7 @@ void MultiLidarNode::loadParameters()
       "nitros_points_merged",
       nvidia::isaac_ros::nitros::NitrosPointCloud2::supported_type_names);
   }
+#endif
 
   auto lidar_params = this->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
   
@@ -97,6 +99,7 @@ void MultiLidarNode::loadParameters()
       lidar_handlers_.emplace_back(std::make_shared<GPULidarHandler>(driver_param, transform));
       RCLCPP_INFO(this->get_logger(), "Initialized lidar: %s", this->declare_parameter(lidar_prefix + "name", "").c_str());
   }
+  last_tf_hashes_.resize(lidar_handlers_.size());
 }
 
 void MultiLidarNode::loadFilterParameters()
@@ -413,6 +416,7 @@ void MultiLidarNode::mergeAndPublish()
         output_msg.header.frame_id = base_frame_id_;
         merged_pub_->publish(output_msg);
 
+#ifdef WITH_NITROS
         if (nitros_pub_)
         {
           auto nitros_output_msg = output_msg;
@@ -424,6 +428,7 @@ void MultiLidarNode::mergeAndPublish()
             .Build();
           nitros_pub_->publish(nitros_msg);
         }
+#endif
     }
   }
 
@@ -538,6 +543,30 @@ rcl_interfaces::msg::SetParametersResult MultiLidarNode::parametersCallback(cons
   return result;
 }
 
+namespace
+{
+  // Helper function to combine hashes
+  template <class T>
+  inline void hash_combine(std::size_t& seed, const T& v)
+  {
+    std::hash<T> hasher;
+    seed ^= hasher(v) + 0x9e3779b9 + (seed<<6) + (seed>>2);
+  }
+
+  size_t hash_transform(const geometry_msgs::msg::Transform& transform)
+  {
+    size_t seed = 0;
+    hash_combine(seed, transform.translation.x);
+    hash_combine(seed, transform.translation.y);
+    hash_combine(seed, transform.translation.z);
+    hash_combine(seed, transform.rotation.x);
+    hash_combine(seed, transform.rotation.y);
+    hash_combine(seed, transform.rotation.z);
+    hash_combine(seed, transform.rotation.w);
+    return seed;
+  }
+}
+
 void MultiLidarNode::checkTfUpdates()
 {
   for (size_t i = 0; i < lidar_frame_ids_.size(); ++i)
@@ -552,32 +581,27 @@ void MultiLidarNode::checkTfUpdates()
       geometry_msgs::msg::TransformStamped transform_stamped = tf_buffer_->lookupTransform(
         base_frame_id_, lidar_frame_ids_[i], tf2::TimePointZero);
 
-      // Convert transform to roll, pitch, yaw and x, y, z
-      tf2::Quaternion q(transform_stamped.transform.rotation.x,
-                        transform_stamped.transform.rotation.y,
-                        transform_stamped.transform.rotation.z,
-                        transform_stamped.transform.rotation.w);
-      tf2::Matrix3x3 m(q);
-      double roll, pitch, yaw;
-      m.getRPY(roll, pitch, yaw);
+      size_t new_hash = hash_transform(transform_stamped.transform);
 
-      double x = transform_stamped.transform.translation.x;
-      double y = transform_stamped.transform.translation.y;
-      double z = transform_stamped.transform.translation.z;
-
-      // Get current parameters
-      std::string tf_prefix = "lidars." + std::to_string(i) + ".tf.";
-      double current_x = this->get_parameter(tf_prefix + "x").as_double();
-      double current_y = this->get_parameter(tf_prefix + "y").as_double();
-      double current_z = this->get_parameter(tf_prefix + "z").as_double();
-      double current_roll = this->get_parameter(tf_prefix + "roll").as_double();
-      double current_pitch = this->get_parameter(tf_prefix + "pitch").as_double();
-      double current_yaw = this->get_parameter(tf_prefix + "yaw").as_double();
-
-      // Check if parameters need to be updated
-      if (std::abs(current_x - x) > 1e-6 || std::abs(current_y - y) > 1e-6 || std::abs(current_z - z) > 1e-6 ||
-          std::abs(current_roll - roll) > 1e-6 || std::abs(current_pitch - pitch) > 1e-6 || std::abs(current_yaw - yaw) > 1e-6)
+      if (new_hash != last_tf_hashes_[i])
       {
+        last_tf_hashes_[i] = new_hash;
+
+        // Convert transform to roll, pitch, yaw and x, y, z
+        tf2::Quaternion q(transform_stamped.transform.rotation.x,
+                          transform_stamped.transform.rotation.y,
+                          transform_stamped.transform.rotation.z,
+                          transform_stamped.transform.rotation.w);
+        tf2::Matrix3x3 m(q);
+        double roll, pitch, yaw;
+        m.getRPY(roll, pitch, yaw);
+
+        double x = transform_stamped.transform.translation.x;
+        double y = transform_stamped.transform.translation.y;
+        double z = transform_stamped.transform.translation.z;
+
+        // Set parameters
+        std::string tf_prefix = "lidars." + std::to_string(i) + ".tf.";
         this->set_parameters({
           rclcpp::Parameter(tf_prefix + "x", x),
           rclcpp::Parameter(tf_prefix + "y", y),
